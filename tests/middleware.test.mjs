@@ -123,10 +123,10 @@ test('optional diagnostics contain counters only', () => {
   }
 });
 
-test('package is directly loadable as middleware and declares real default options', async () => {
+test('package exposes the middleware and provider entries with matching middleware defaults', async () => {
   const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(pkg.magpie.middleware, './responses.middleware.mjs');
-  assert.equal(pkg.main, undefined);
+  assert.equal(pkg.main, './provider.mjs');
   assert.equal(pkg.exports, undefined);
   assert.equal(pkg.dependencies, undefined);
   assert.ok(pkg.files.includes('lib/sanitize.mjs'));

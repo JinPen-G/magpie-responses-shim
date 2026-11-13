@@ -14,7 +14,9 @@ const repository = fileURLToPath(new URL('..', import.meta.url));
 const temporaryParent = path.join(repository, 'output', '.tmp');
 const temporary = path.join(temporaryParent, 'magpie-verification');
 const executable = process.argv[2] || process.env.MAGPIE_TEST_BINARY;
+const bunExecutable = process.argv[3] || process.env.MAGPIE_BUN;
 assert.ok(executable, 'Pass the installed Magpie executable path.');
+assert.ok(bunExecutable, 'Pass an existing Bun executable path as the second argument or MAGPIE_BUN.');
 assert.equal(process.platform, 'win32', 'This host verification isolates Windows USERPROFILE. Run npm test on other platforms.');
 
 const controller = new AbortController();
@@ -77,8 +79,11 @@ try {
     PATHEXT: '.COM;.EXE;.BAT;.CMD',
     ...folders,
     MAGPIE_ADDR: `127.0.0.1:${port}`,
-    MAGPIE_NO_ACCOUNTS: '1',
+    // Account-backed provider plugins require discovery. Every profile and
+    // credential location here is an empty directory owned by this test.
+    MAGPIE_NO_ACCOUNTS: '0',
     MAGPIE_PLUGIN_MARKET: 'off',
+    MAGPIE_BUN: bunExecutable,
     DO_NOT_TRACK: '1',
   };
 
@@ -99,7 +104,21 @@ try {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    captures.push({ path: request.url, body });
+    captures.push({
+      path: request.url,
+      body,
+      headers: {
+        'user-agent': request.headers['user-agent'],
+        originator: request.headers.originator,
+        'x-codex-turn-metadata': request.headers['x-codex-turn-metadata'],
+      },
+    });
+    if (['/agentrouter/v1/responses', '/shim/v1/responses'].includes(request.url) && body.input.some(item =>
+      item.type === 'reasoning' || ['msg_old', 'fc_old', 'fco_old', 'at_old'].includes(item.id))) {
+      response.writeHead(400, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: { message: 'The requested item was created under a different Azure OpenAI resource.' } }));
+      return;
+    }
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const completed = {
       id: 'resp_fixture', object: 'response', status: 'completed', model: 'fixture-model',
@@ -110,27 +129,39 @@ try {
     response.end(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: completed })}\n\n`);
   });
   const upstreamPort = await listen(upstream);
+  await writeFile(path.join(config, 'plugins.json'), JSON.stringify({
+    plugins: [{ spec: repository, options: { upstream: `http://127.0.0.1:${upstreamPort}/shim/v1`, log: true } }],
+  }));
+  await writeFile(path.join(config, 'plugin-auth.json'), JSON.stringify({
+    'agentrouter-shim': { type: 'api', key: 'local-fixture-key' },
+  }));
   await writeFile(path.join(config, 'providers.json'), JSON.stringify({
     noAutoGroups: true,
-    providers: ['agentrouter', 'other'].map(id => ({
-      id, name: id, key: 'local-fixture-key',
-      responses: `http://127.0.0.1:${upstreamPort}/${id}/v1`,
-      models: ['fixture-model'],
-      codexAsSent: true,
-    })),
+    providers: [
+      ...['agentrouter', 'other'].map(id => ({
+        id, name: id, key: 'local-fixture-key',
+        responses: `http://127.0.0.1:${upstreamPort}/${id}/v1`,
+        models: ['fixture-model'],
+        codexAsSent: true,
+      })),
+      {
+        id: 'agentrouter-shim',
+        passHeaders: ['User-Agent', 'Originator', 'X-Codex-Turn-Metadata'],
+      },
+    ],
   }));
   await writeFile(path.join(config, 'settings.json'), JSON.stringify({
-    subscriptionAccounts: false,
     sessionReads: { asked: true, all: false, agents: {} },
   }));
 
   console.log((await command('--version')).trim());
-  await command('plugin', 'add', repository);
   const listed = JSON.parse(await command('plugin', '--json'));
   const state = Object.values(listed.middleware ?? {})[0];
   assert.ok(state?.hooks.includes('onProvider'), 'Magpie must discover onProvider.');
   assert.ok(!state.error, state.error);
-  console.log('PASS: Magpie loads the package as gateway middleware.');
+  const listedProvider = listed.providers.find(provider => provider.id === 'agentrouter-shim');
+  assert.ok(listedProvider?.models.some(model => model.id === 'fixture-model'));
+  console.log('PASS: Magpie loads both middleware and the account-backed provider.');
 
   gateway = spawn(executable, ['serve'], {
     cwd: temporary, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
@@ -212,6 +243,59 @@ try {
     }
     console.log(`PASS: ${provider} ${asSent ? 'Codex as-sent' : 'standard'} request and SSE verified through Magpie.`);
   }
+
+  const compactHistory = {
+    model: 'agentrouter/fixture-model', stream: true, store: false,
+    input: [
+      { type: 'reasoning', id: 'rs_old', summary: [], encrypted_content: 'fixture-ciphertext' },
+      { type: 'message', id: 'msg_old', role: 'assistant', content: [{ type: 'output_text', text: 'Earlier answer', annotations: [] }] },
+      { role: 'user', content: 'Continue the work' },
+      { type: 'compaction_trigger' },
+    ],
+  };
+  const headers = {
+    'content-type': 'application/json',
+    'user-agent': 'codex_cli_rs/0.167.0 (Windows; x86_64)',
+    originator: 'codex_cli_rs',
+    'x-codex-turn-metadata': '{"thread_id":"fixture-thread","turn_id":"fixture-turn"}',
+  };
+  const post = async (body, expectedStatus = 200) => {
+    const response = await fetch(`${base}/v1/responses`, {
+      method: 'POST', headers, body: JSON.stringify(body),
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]),
+    });
+    const text = await response.text();
+    assert.equal(response.status, expectedStatus, text);
+    if (expectedStatus !== 200) return text;
+    assert.match(text, /response.completed/);
+    return text.split('\n').filter(line => line.startsWith('data:')).map(line => JSON.parse(line.slice(5)));
+  };
+
+  let captureStart = captures.length;
+  const compactError = await post(compactHistory, 400);
+  assert.match(compactError, /different Azure OpenAI resource/);
+  const uncleanedCompact = captures.slice(captureStart).find(capture => capture.path === '/agentrouter/v1/responses')?.body;
+  assert.ok(uncleanedCompact?.input.some(item => item.type === 'reasoning'), 'The fixture must reproduce the middleware bypass during compaction.');
+  console.log('PASS: reproduced compaction bypassing gateway middleware.');
+
+  captureStart = captures.length;
+  const compactEvents = await post({ ...compactHistory, model: 'agentrouter-shim/fixture-model' });
+  const compactSent = captures.slice(captureStart).filter(capture => capture.path === '/shim/v1/responses');
+  assert.equal(compactSent.length, 1, `The provider transport must clean the first summary attempt.\n${gatewayLog.slice(-12000)}\n${JSON.stringify(captures.slice(captureStart))}`);
+  assert.ok(!compactSent[0].body.input.some(item => item.type === 'reasoning' || item.id === 'msg_old'));
+  assert.ok(compactSent[0].body.input.some(item => JSON.stringify(item).includes('Earlier answer')));
+  assert.equal(compactSent[0].headers['user-agent'], headers['user-agent']);
+  assert.equal(compactSent[0].headers.originator, headers.originator);
+  assert.equal(compactSent[0].headers['x-codex-turn-metadata'], headers['x-codex-turn-metadata']);
+  const compactItem = compactEvents.find(event => event.type === 'response.output_item.done' && event.item?.type === 'compaction')?.item;
+  assert.ok(compactItem?.encrypted_content?.startsWith('magpie1:'), 'Magpie must return its portable text summary.');
+  assert.equal(Buffer.from(compactItem.encrypted_content.slice('magpie1:'.length), 'base64').toString(), 'OK');
+  captureStart = captures.length;
+  await post({ model: 'agentrouter-shim/fixture-model', stream: true, store: false, input: [compactItem, { role: 'user', content: 'Continue after compaction' }] });
+  const continued = captures.slice(captureStart).find(capture => capture.path === '/shim/v1/responses')?.body;
+  assert.ok(continued?.input.some(item => JSON.stringify(item).includes('OK')));
+  assert.ok(!continued.input.some(item => item.type === 'compaction'));
+  console.log('PASS: provider transport cleans compaction, passes configured client headers, returns its summary and continues the conversation.');
   assert.ok(!/middleware .*\[(?:error|warn)\]/.test(gatewayLog), gatewayLog);
 } catch (error) {
   console.error(error);
