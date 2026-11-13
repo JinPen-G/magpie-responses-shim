@@ -1,0 +1,46 @@
+{
+  "name": "magpie-responses-shim",
+  "version": "0.1.0",
+  "description": "Magpie gateway middleware for resource-bound OpenAI Responses history",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JinPen-G/magpie-responses-shim.git"
+  },
+  "homepage": "https://github.com/JinPen-G/magpie-responses-shim#readme",
+  "bugs": {
+    "url": "https://github.com/JinPen-G/magpie-responses-shim/issues"
+  },
+  "keywords": [
+    "magpie-plugin",
+    "magpie",
+    "middleware",
+    "agentrouter",
+    "openai",
+    "responses"
+  ],
+  "files": [
+    "responses.middleware.mjs",
+    "lib/sanitize.mjs",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/middleware.test.mjs",
+    "test:magpie": "node tests/verify-magpie.mjs"
+  },
+  "magpie": {
+    "name": "Responses 跨资源修复",
+    "summary": {
+      "zh": "清理 AgentRouter 请求中的历史推理项和可内联重放的资源 ID，缓解 Responses 跨资源错误。",
+      "en": "Clean resource-bound reasoning and replayable item IDs in AgentRouter Responses requests."
+    },
+    "middleware": "./responses.middleware.mjs",
+    "options": {
+      "providers": ["agentrouter"],
+      "log": false
+    }
+  }
+}
