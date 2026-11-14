@@ -1,6 +1,6 @@
 {
   "name": "magpie-responses-shim",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Magpie Responses provider and middleware that clean resource-bound history, including compaction requests",
   "type": "module",
   "main": "./provider.mjs",
